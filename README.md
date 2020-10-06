@@ -42,9 +42,7 @@ while True:
 
 ## Installation
 
-Currently, JACDAC is not merged into mainline CircuitPython and only works on NRF52-based boards. A JACDAC-enabled uf2 CircuitPython file for the Adafruit Clue is provided in the samples folder. You will have to compile CircuitPython for other NRF52-based boards.
-
-To build a JACDAC CircuitPython binary:
+Currently, JACDAC is not merged into mainline CircuitPython and only works on NRF52-based boards. A JACDAC-enabled uf2 CircuitPython file for the Adafruit Clue is provided in the samples folder (`samples/JD_CPY_CLUE.uf2`). If you are using a different NRF52-based board, you will have to compile CircuitPython yourself by:
 
 1. clone https://github.com/jamesadevine/circuitpython and checkout the `jacdac` branch.
 2. `git submodule init && git submodule sync && git submodule update`
