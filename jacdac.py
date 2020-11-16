@@ -63,7 +63,7 @@ class JDPacket:
     header = None
     data = None
     size = None
-    service_instance = None
+    service_index = None
     service_command = None
 
     def __init__(self, header, data):
@@ -75,7 +75,7 @@ class JDPacket:
         if data is not None:
             upack = struct.unpack_from('<BBH', data, 0)
             self.size = upack[0]
-            self.service_instance = upack[1]
+            self.service_index = upack[1]
             self.service_command = upack[2]
             self.data = data[4:]
 
@@ -99,12 +99,12 @@ class JDPacket:
 
     def serialize(self):
         b = bytearray(4)
-        struct.pack_into('<BBH', b, 0, len(self.data), self.service_instance, self.service_command)
+        struct.pack_into('<BBH', b, 0, len(self.data), self.service_index, self.service_command)
         return self.header.serialize() + b + self.data
 
 
 class JDServiceHost:
-    service_instance = None
+    service_index = None
     service_class = None
     time = 0
     stack = None
@@ -137,7 +137,7 @@ class JDServiceHost:
     def send_report(self, cmd, data):
         resp = JDPacket(None, None)
         resp.service_command = cmd
-        resp.service_instance = self.service_instance
+        resp.service_index = self.service_index
         resp.data = data
         self.stack.send_report(resp)
 
@@ -153,7 +153,7 @@ class JDControl(JDServiceHost):
     def handle_command(self, p):
         cmd = p.service_command & CMD_VAL_MASK
         resp = JDPacket(None, None)
-        resp.service_instance = 0
+        resp.service_index = 0
 
         if cmd == CMD_CTRL_RESET:
             supervisor.reload()
@@ -178,7 +178,7 @@ class JDControl(JDServiceHost):
         self.time = now
 
         adv = JDPacket(None, None)
-        adv.service_instance = 0
+        adv.service_index = 0
         adv.service_command = 0
         adv.data = bytearray(len(self.stack.services) * 4)
 
@@ -332,7 +332,7 @@ class JDStack:
     def add_service(self, service):
         #todo: in future we may want to have differentiation between client/host services
         self.services += [service]
-        service.service_instance = len(self.services) - 1
+        service.service_index = len(self.services) - 1
 
     def process(self):
         p = self.bus.receive(self.buf)
@@ -352,9 +352,9 @@ class JDStack:
             p = self.bus.receive(self.buf)
 
         for p in packets:
-            if p.header.device_id == self.dev.device_id and p.service_instance < len(self.services):
-                self.services[p.service_instance].handle_packet(p)
-            elif p.service_instance == 0 and p.service_command == CMD_ADVERTISEMENT_DATA:
+            if p.header.device_id == self.dev.device_id and p.service_index < len(self.services):
+                self.services[p.service_index].handle_packet(p)
+            elif p.service_index == 0 and p.service_command == CMD_ADVERTISEMENT_DATA:
                 found = None
                 for d in self.devices:
                     if d.device_id == p.header.device_id:
