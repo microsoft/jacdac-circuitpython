@@ -5,6 +5,7 @@ import struct
 import microcontroller
 import supervisor
 import ubinascii
+import tasko
 
 JD_SERIAL_HEADER_SIZE = const(16)
 JD_SERIAL_MAX_PAYLOAD_SIZE = const(236)
@@ -33,6 +34,20 @@ CMD_EVENT_MASK = const(0x8000)
 CMD_EVENT_CODE_MASK = const(0xff)
 CMD_EVENT_COUNTER_MASK = const(0x7f)
 CMD_EVENT_COUNTER_POS = const(8)
+
+EV_CHANGE = const("change")
+EV_DEVICE_CONNECT = const("deviceConnect")
+EV_DEVICE_CHANGE = const("deviceChange")
+EV_DEVICE_ANNOUNCE = const("deviceAnnounce")
+EV_SELF_ANNOUNCE = const("selfAnnounce")
+EV_PACKET_PROCESS = const("packetProcess")
+EV_REPORT_RECEIVE = const("reportReceive")
+EV_REPORT_UPDATE = const("reportUpdate")
+EV_RESTART = const("restart")
+EV_PACKET_RECEIVE = const("packetReceive")
+EV_EVENT = const("packetEvent")
+EV_STATUS_EVENT = const("statusEvent")
+EV_IDENTIFY = const("identify")
 
 _ACK_RETRIES = const(4)
 _ACK_DELAY = const(40)
@@ -63,8 +78,25 @@ def u32(buf: bytes, off: int):
     return buf[off] | (buf[off+1] << 8) | (buf[off+2] << 16) | (buf[off+3] << 24)
 
 
+# TODO implement this in C for half-decent precision
+def now():
+    return int(time.monotonic() * 1000)
+
+
+# TODO would we want the "u32 u16" kind of format strings?
+def unpack(buf: bytes, fmt: str = None):
+    if fmt is None or buf is None:
+        return buf
+    return struct.unpack(fmt, buf)
+
+
+def pack(fmt: str, *args):
+    return struct.pack(fmt, *args)
+
+
 class JDPacket:
     def __init__(self, *, cmd: int = None, size: int = 0, frombytes: bytes = None) -> None:
+        self.timestamp = now()
         if frombytes is None:
             self._header = bytearray(JD_SERIAL_HEADER_SIZE)
             self._data = bytearray(size)
@@ -193,20 +225,93 @@ class JDPacket:
         return "<JDPacket {}>".format(self.to_string())
 
 
-class Bus:
+class EventEmitter:
+    def emit(id: str, *args):
+        pass
+
+
+class Bus(EventEmitter):
     def __init__(self) -> None:
         self.devices = []
 
 
 _JD_CONTROL_ANNOUNCE_FLAGS_RESTART_COUNTER_STEADY = const(0xf)
+_QUERY_GC_MS = const(10000)
+
+class Client(EventEmitter):
+    def __init__(self, bus: Bus) -> None:
+        self.bus = bus
+        self.broadcast = False
+        self.service_class = 0
+        self.service_index = 0
+        self.current_device: Device = None
+        self._queries: list[list[any]] = []
+
+    def _lookup_query(self, code: int, refresh_ms: int):
+        idx = 0
+        n = now()
+        hasold = False
+        oldtime = n - _QUERY_GC_MS
+        for (data, timestamp, qcode, *_) in self._queries:
+            if timestamp < oldtime: hasold = True
+            idx += 1
+            if code == qcode:
+                if timestamp + refresh_ms < n:
+                    if data is not None:
+                        del self._queries[idx]
+                        if hasold: self._gc_queries()
+                        return None
+                return self._queries[idx]
+        if hasold: self._gc_queries()
+        return None
+
+    def _gc_queries(self):
+        oldtime = now() - _QUERY_GC_MS
+        idx = 0
+        while idx < len(self._queries):
+            _, timestamp, _, *callbacks = self._queries[idx]
+            if timestamp < oldtime:
+                del self._queries[idx]
+                # resume any callbacks - they will get None data, and throw
+                for f in callbacks: f()
+            else:
+                idx += 1
+
+    async def query_register(self, code: int, refresh_ms=500):
+        code |= CMD_GET_REG
+        query = self._lookup_query(code, refresh_ms)
+        if query and query[0]:
+            return query[0]
+        if query is None:
+            query = [None, now(), code]
+            # TODO send query
+            self._queries.append(query)
+        suspend, resume = tasko.suspend()
+        query.append(resume)
+        await suspend
+        if query[0] is None:
+            raise RuntimeError("register {0} timeout".format(code))
+        return query[0]
+
+    def register_value(self, code: int, refresh_ms=500):
+        r = self._lookup_query(code | CMD_GET_REG, refresh_ms)
+        if r is None:
+            return None
+        else:
+            return r[0]
+
+    def handle_packet_outer(self, pkt: JDPacket):
+        pass
 
 
-class Device:
+class Device(EventEmitter):
     def __init__(self, bus: Bus, device_id: str, services: bytearray) -> None:
         self.bus = bus
         self.device_id = device_id
         self.services = services
-        self.clients = []
+        self.clients: list[Client] = []
+        self.last_seen = now()
+        self._event_counter: int = None
         bus.devices.append(self)
 
     @property
@@ -225,67 +330,93 @@ class Device:
     def is_connected(self):
         return self.clients != None
 
+    @property
+    def short_id(self):
+        return self.device_id  # TODO
+
+    def __str__(self) -> str:
+        return "<JDDevice {}>".format(self.short_id)
+
+    def service_class_at(self, idx: int):
+        if idx == 0:
+            return 0
+        if idx < 0 or idx >= self.num_service_classes:
+            return None
+        return u32(self.services, idx << 2)
+
+    @property
+    def num_service_classes(self):
+        return len(self.services) >> 2
+
+    def process_packet(self, pkt: JDPacket):
+        self.last_seen = now()
+        self.emit(EV_PACKET_RECEIVE, pkt)
+
+        service_class = self.service_class_at(pkt.service_index)
+        if not service_class or service_class == 0xffffffff:
+            return
+
+        if pkt.is_event:
+            ec = self._event_counter
+            if ec is None:
+                ec = pkt.event_counter - 1
+            ec += 1
+            # how many packets ahead and behind current are we?
+            ahead = (pkt.event_counter - ec) & CMD_EVENT_COUNTER_MASK
+            behind = (ec - pkt.event_counter) & CMD_EVENT_COUNTER_MASK
+            # ahead == behind == 0 is the usual case, otherwise
+            # behind < 60 means self is an old event (or retransmission of something we already processed)
+            # ahead < 5 means we missed at most 5 events, so we ignore self one and rely on retransmission
+            # of the missed events, and then eventually the current event
+            if ahead > 0 and (behind < 60 or ahead < 5):
+                return
+            # we got our event
+            self.emit(EV_EVENT, pkt)
+            self.bus.emit(EV_EVENT, pkt)
+            self._event_counter = pkt.event_counter
+
+        client = next(c for c in self.clients if
+                      (c.service_class == service_class if c.broadcast else c.service_index == pkt.service_index), None)
+
+        if client:
+            # log(`handle pkt at ${client.role} rep=${pkt.serviceCommand}`)
+            client.current_device = self
+            client.handle_packet_outer(pkt)
+
 
 """
 
     export class Device extends EventSource {
         lastSeen: number
         clients: Client[] = []
-        private _eventCounter: number
+        private _event_counter: number
         private _shortId: string
         private queries: RegQuery[]
         _score: number
 
-        get isConnected() {
-            return this.clients != null
-        }
-
-        get shortId() {
-            // TODO measure if caching is worth it
-            if (!this._shortId) this._shortId = shortDeviceId(this.deviceId)
-            return this._shortId
-        }
-
-        toString() {
-            return this.shortId
-        }
-
         matchesRoleAt(role: string, serviceIdx: number) {
             if (!role) return true
 
-            if (role == this.deviceId) return true
-            if (role == this.deviceId + ":" + serviceIdx) return true
+            if (role == self.deviceId) return true
+            if (role == self.deviceId + ":" + serviceIdx) return true
 
-            return jacdac._rolemgr.getRole(this.deviceId, serviceIdx) == role
+            return jacdac._rolemgr.getRole(self.deviceId, serviceIdx) == role
         }
 
         private lookupQuery(reg: number) {
-            if (!this.queries) this.queries = []
-            return this.queries.find(q => q.reg == reg)
-        }
-
-        get serviceClassLength() {
-            return this.services.length >> 2
-        }
-
-        serviceClassAt(serviceIndex: number) {
-            return serviceIndex == 0
-                ? 0
-                : this.services.getNumber(
-                      NumberFormat.UInt32LE,
-                      serviceIndex << 2
-                  )
+            if (!self.queries) self.queries = []
+            return self.queries.find(q => q.reg == reg)
         }
 
         queryInt(reg: number, refreshRate = 1000) {
-            const v = this.query(reg, refreshRate)
+            const v = self.query(reg, refreshRate)
             if (!v) return undefined
             return intOfBuffer(v)
         }
 
         query(reg: number, refreshRate = 1000) {
-            let q = this.lookupQuery(reg)
-            if (!q) this.queries.push((q = new RegQuery(reg)))
+            let q = self.lookupQuery(reg)
+            if (!q) self.queries.push((q = new RegQuery(reg)))
 
             const now = control.millis()
             if (
@@ -294,15 +425,15 @@ class Device:
                 (refreshRate != null && now - q.lastQuery > refreshRate)
             ) {
                 q.lastQuery = now
-                this.sendCtrlCommand(CMD_GET_REG | reg)
+                self.sendCtrlCommand(CMD_GET_REG | reg)
             }
             return q.value
         }
 
         get uptime(): number {
             // create query
-            this.query(ControlReg.Uptime, 60000)
-            const q = this.lookupQuery(ControlReg.Uptime)
+            self.query(ControlReg.Uptime, 60000)
+            const q = self.lookupQuery(ControlReg.Uptime)
             if (q.value) {
                 const up = q.value.getNumber(NumberFormat.UInt32LE, 0)
                 const offset = (control.millis() - q.lastReport) * 1000
@@ -312,69 +443,32 @@ class Device:
         }
 
         get mcuTemperature(): number {
-            return this.queryInt(ControlReg.McuTemperature)
+            return self.queryInt(ControlReg.McuTemperature)
         }
 
         get firmwareVersion(): string {
-            const b = this.query(ControlReg.FirmwareVersion, null)
+            const b = self.query(ControlReg.FirmwareVersion, null)
             if (b) return b.toString()
             else return ""
         }
 
         get firmwareUrl(): string {
-            const b = this.query(ControlReg.FirmwareUrl, null)
+            const b = self.query(ControlReg.FirmwareUrl, null)
             if (b) return b.toString()
             else return ""
         }
 
         get deviceUrl(): string {
-            const b = this.query(ControlReg.DeviceUrl, null)
+            const b = self.query(ControlReg.DeviceUrl, null)
             if (b) return b.toString()
             else return ""
         }
 
-        processPacket(pkt: JDPacket) {
-            this.lastSeen = control.millis()
-            this.emit(PACKET_RECEIVE, pkt)
-
-            const serviceClass = this.serviceClassAt(pkt.serviceIndex)
-            if (!serviceClass || serviceClass == 0xffffffff) return
-
-            if (pkt.isEvent) {
-                let ec = this._eventCounter
-                if (ec === undefined) ec = pkt.eventCounter - 1
-                ec++
-                // how many packets ahead and behind current are we?
-                const ahead = (pkt.eventCounter - ec) & CMD_EVENT_COUNTER_MASK
-                const behind = (ec - pkt.eventCounter) & CMD_EVENT_COUNTER_MASK
-                // ahead == behind == 0 is the usual case, otherwise
-                // behind < 60 means this is an old event (or retransmission of something we already processed)
-                // ahead < 5 means we missed at most 5 events, so we ignore this one and rely on retransmission
-                // of the missed events, and then eventually the current event
-                if (ahead > 0 && (behind < 60 || ahead < 5)) return
-                // we got our event
-                this.emit(EVENT, pkt)
-                bus.emit(EVENT, pkt)
-                this._eventCounter = pkt.eventCounter
-            }
-
-            const client = this.clients.find(c =>
-                c.broadcast
-                    ? c.serviceClass == serviceClass
-                    : c.serviceIndex == pkt.serviceIndex
-            )
-            if (client) {
-                // log(`handle pkt at ${client.role} rep=${pkt.serviceCommand}`)
-                client.currentDevice = this
-                client.handlePacketOuter(pkt)
-            }
-        }
-
         handleCtrlReport(pkt: JDPacket) {
-            this.lastSeen = control.millis()
+            self.lastSeen = control.millis()
             if (pkt.isRegGet) {
                 const reg = pkt.regCode
-                const q = this.lookupQuery(reg)
+                const q = self.lookupQuery(reg)
                 if (q) {
                     q.value = pkt.data
                     q.lastReport = control.millis()
@@ -382,16 +476,16 @@ class Device:
             }
         }
 
-        hasService(serviceClass: number) {
-            const n = this.serviceClassLength
+        hasService(service_class: number) {
+            const n = self.serviceClassLength
             for (let i = 0; i < n; ++i)
-                if (this.serviceClassAt(i) === serviceClass) return true
+                if (self.serviceClassAt(i) === service_class) return true
             return false
         }
 
-        clientAtServiceIndex(serviceIndex: number) {
-            for (const c of this.clients) {
-                if (c.device == this && c.serviceIndex == serviceIndex) return c
+        clientAtServiceIndex(service_index: number) {
+            for (const c of self.clients) {
+                if (c.device == self && c.service_index == service_index) return c
             }
             return null
         }
@@ -400,14 +494,14 @@ class Device:
             const pkt = !payload
                 ? JDPacket.onlyHeader(cmd)
                 : JDPacket.from(cmd, payload)
-            pkt.serviceIndex = JD_SERVICE_INDEX_CTRL
-            pkt._sendCmd(this)
+            pkt.service_index = JD_SERVICE_INDEX_CTRL
+            pkt._sendCmd(self)
         }
 
         _destroy() {
-            log("destroy " + this.shortId)
-            for (let c of this.clients) c._detach()
-            this.clients = null
+            log("destroy " + self.shortId)
+            for (let c of self.clients) c._detach()
+            self.clients = null
         }
     }
 
@@ -454,7 +548,7 @@ ackAwaiters: list[AckAwaiter] = []
         _sendCore() {
             if (self._data.length != self._header[12]) throw "jdsize mismatch"
             jacdac.__physSendPacket(self._header, self._data)
-            bus.processPacket(this) // handle loop-back packet
+            bus.processPacket(self) // handle loop-back packet
         }
 
         _sendReport(dev: Device) {
@@ -475,11 +569,11 @@ ackAwaiters: list[AckAwaiter] = []
             self._sendCore()
         }
 
-        sendAsMultiCommand(serviceClass: number) {
+        sendAsMultiCommand(service_class: number) {
             self._header[3] |=
                 JD_FRAME_FLAG_IDENTIFIER_IS_SERVICE_CLASS |
                 JD_FRAME_FLAG_COMMAND
-            self._header.setNumber(NumberFormat.UInt32LE, 4, serviceClass)
+            self._header.setNumber(NumberFormat.UInt32LE, 4, service_class)
             self._header.setNumber(NumberFormat.UInt32LE, 8, 0)
             self._sendCore()
         }
@@ -500,7 +594,7 @@ ackAwaiters: list[AckAwaiter] = []
                 })
             }
 
-            const aw = new AckAwaiter(this, devId)
+            const aw = new AckAwaiter(self, devId)
             ackAwaiters.push(aw)
             while (aw.nextRetry > 0)
                 control.waitForEvent(DAL.DEVICE_ID_NOTIFY, aw.eventId)
