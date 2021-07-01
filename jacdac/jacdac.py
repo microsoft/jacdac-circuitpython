@@ -48,6 +48,8 @@ EV_PACKET_RECEIVE = const("packetReceive")
 EV_EVENT = const("packetEvent")
 EV_STATUS_EVENT = const("statusEvent")
 EV_IDENTIFY = const("identify")
+EV_CONNECTED = const("connected")
+EV_DISCONNECTED = const("disconnected")
 
 _ACK_RETRIES = const(4)
 _ACK_DELAY = const(40)
@@ -78,7 +80,14 @@ def u32(buf: bytes, off: int):
     return buf[off] | (buf[off+1] << 8) | (buf[off+2] << 16) | (buf[off+3] << 24)
 
 
+def log(msg: str, *args):
+    if len(args):
+        msg = msg.format(*args)
+    print("JD: " + msg)
+
 # TODO implement this in C for half-decent precision
+
+
 def now():
     return int(time.monotonic() * 1000)
 
@@ -226,82 +235,327 @@ class JDPacket:
 
 
 class EventEmitter:
-    def emit(id: str, *args):
-        pass
+    def emit(self, id: str, *args):
+        if not hasattr(self, "_listeners"):
+            return
+        # copy list before iteration, in case it's modified
+        for lid, fn in self._listeners[:]:
+            if lid == id:
+                fn(*args)
+
+    def _init_emitter(self):
+        if not hasattr(self, "_listeners"):
+            self._listeners = []
+
+    def on(self, id: str, fn):
+        self._init_emitter()
+        self._listeners.append((id, fn))
+
+    def off(self, id: str, fn):
+        self._init_emitter()
+        for i in range(len(self._listeners)):
+            id2, fn2 = self._listeners[i]
+            if id == id2 and fn is fn2:
+                del self._listeners[i]
+                return
+        raise ValueError("no matching on")
+
+    def once(self, id: str, fn):
+        def wrapper(*args):
+            self.off(id, wrapper)
+            fn(*args)
+        self.on(id, wrapper)
+
+    async def event(self, id: str):
+        suspend, resume = tasko.suspend()
+        self.once(id, resume)
+        await suspend
+
+
+def _service_matches(dev: 'Device', serv: bytearray):
+    ds = dev.services
+    if not ds or len(ds) != len(serv):
+        return False
+    for i in range(4, len(serv)):
+        if ds[i] != serv[i]:
+            return False
+    return True
 
 
 class Bus(EventEmitter):
     def __init__(self) -> None:
-        self.devices = []
+        self.devices: list['Device'] = []
+        self.unattached_clients: list['Client'] = []
+        self.all_clients: list['Client'] = []
+        self.self_device = Device(self, "1234aabbccdd9900", bytearray(4))
+        self.host_services: list['Server'] = []
+
+    def process_packet(self, pkt: JDPacket):
+        pass
+
+    def _send_core(self, pkt: JDPacket):
+        assert pkt._data.length == pkt._header[12]
+        # TODO
+        self.process_packet(pkt)  # handle loop-back packet
+
+    def clear_attach_cache(self):
+        pass
+
+    def _reattach(self, dev: 'Device'):
+        dev.last_seen = now()
+        log("reattaching services to {}; {}/{} to attach", dev,
+            len(self.unattached_clients), len(self.all_clients))
+        new_clients = []
+        occupied = bytearray(dev.num_service_classes)
+        for c in dev.clients:
+            if c.broadcast:
+                c._detach()
+                continue  # will re-attach
+
+            new_class = dev.service_class_at(c.service_index)
+            if new_class == c.service_class and dev.matches_role_at(c.role, c.service_index):
+                new_clients.append(c)
+                occupied[c.service_index] = 1
+            else:
+                c._detach()
+
+        dev.clients = new_clients
+        self.emit(EV_DEVICE_ANNOUNCE, dev)
+
+        if len(self.unattached_clients) == 0:
+            return
+
+        for i in range(1, dev.num_service_classes):
+            if occupied[i]:
+                continue
+            service_class = dev.service_class_at(i)
+            for cc in self.unattached_clients:
+                if cc.service_class == service_class:
+                    if cc._attach(dev, i):
+                        break
+
+    def process_packet(self, pkt: JDPacket):
+        # log("route: {}", pkt)
+        dev_id = pkt.device_identifier
+        multi_command_class = pkt.multicommand_class
+
+        # TODO implement send queue for packet compression
+
+        # if (pkt.requires_ack):
+        #     pkt.requires_ack = False  # make sure we only do it once
+        #     if pkt.device_identifier == self.self_device.device_id:
+        #         ack = JDPacket(cmd=pkt.crc)
+        #         ack.service_index = JD_SERVICE_INDEX_CRC_ACK
+        #         ack._send_report(self.self_device)
+
+        self.emit(EV_PACKET_PROCESS, pkt)
+
+        if multi_command_class != None:
+            if not pkt.is_command:
+                return  # only commands supported in multi-command
+            for h in self.host_services:
+                if h.service_class == multi_command_class and h.running:
+                    # pretend it's directly addressed to us
+                    pkt.device_identifier = self.self_device.device_id
+                    pkt.service_index = h.service_index
+                    h.handle_packet_outer(pkt)
+        elif dev_id == self.self_device.device_id and pkt.is_command:
+            h = self.host_services[pkt.service_index]
+            if h and h.running:
+                # log(`handle pkt at ${h.name} cmd=${pkt.service_command}`)
+                h.handle_packet_outer(pkt)
+        else:
+            if pkt.is_command:
+                return  # it's a command, and it's not for us
+
+            dev = next(d for d in self.devices if d.device_id == dev_id, None)
+
+            if (pkt.service_index == JD_SERVICE_INDEX_CTRL):
+                if (pkt.service_command == 0):
+                    if (dev and dev.reset_count > (pkt.data[0] & 0xf)):
+                        # if the reset counter went down, it means the device reseted;
+                        # treat it as new device
+                        log("device {} resetted", dev)
+                        self.devices.remove(dev)
+                        dev._destroy()
+                        dev = None
+                        self.emit(EV_RESTART)
+
+                    matches = False
+                    if not dev:
+                        dev = Device(pkt.device_identifier, pkt.data)
+                        # ask for uptime
+                        # dev.send_ctrl_command(CMD_GET_REG | ControlReg.Uptime)
+                        self.emit(EV_DEVICE_CONNECT, dev)
+                    else:
+                        matches = _service_matches(dev, pkt.data)
+                        dev.services = pkt.data
+
+                    if not matches:
+                        self._reattach(dev)
+                if dev:
+                    dev.process_packet(pkt)
+                return
+            elif (pkt.service_index == JD_SERVICE_INDEX_CRC_ACK):
+                # _got_ack(pkt)
+                pass
+
+            # we can't know the serviceClass,
+            # no announcement seen yet for this device
+            if not dev:
+                return
+
+            dev.process_packet(pkt)
 
 
 _JD_CONTROL_ANNOUNCE_FLAGS_RESTART_COUNTER_STEADY = const(0xf)
-_QUERY_GC_MS = const(10000)
 
-class Client(EventEmitter):
-    def __init__(self, bus: Bus) -> None:
-        self.bus = bus
-        self.broadcast = False
-        self.service_class = 0
-        self.service_index = 0
-        self.current_device: Device = None
-        self._queries: list[list[any]] = []
 
-    def _lookup_query(self, code: int, refresh_ms: int):
-        idx = 0
-        n = now()
-        hasold = False
-        oldtime = n - _QUERY_GC_MS
-        for (data, timestamp, qcode, *_) in self._queries:
-            if timestamp < oldtime: hasold = True
-            idx += 1
-            if code == qcode:
-                if timestamp + refresh_ms < n:
-                    if data is not None:
-                        del self._queries[idx]
-                        if hasold: self._gc_queries()
-                        return None
-                return self._queries[idx]
-        if hasold: self._gc_queries()
+def delayed_callback(seconds, fn):
+    async def task():
+        await tasko.sleep(seconds)
+        fn()
+    tasko.add_task(task())
+
+
+class RawRegisterClient(EventEmitter):
+    def __init__(self, client: 'Client', code: int) -> None:
+        self.code = code
+        self._data: bytearray = None
+        self._refreshed_at = 0
+        self.client = client
+
+    def current(self, refresh_ms=500):
+        if self._refreshed_at + refresh_ms >= now():
+            return self._data
         return None
 
-    def _gc_queries(self):
-        oldtime = now() - _QUERY_GC_MS
-        idx = 0
-        while idx < len(self._queries):
-            _, timestamp, _, *callbacks = self._queries[idx]
-            if timestamp < oldtime:
-                del self._queries[idx]
-                # resume any callbacks - they will get None data, and throw
-                for f in callbacks: f()
-            else:
-                idx += 1
+    def _query(self):
+        pkt = JDPacket(cmd=(CMD_GET_REG | self.code))
+        self.client.send_cmd(pkt)
 
-    async def query_register(self, code: int, refresh_ms=500):
-        code |= CMD_GET_REG
-        query = self._lookup_query(code, refresh_ms)
-        if query and query[0]:
-            return query[0]
-        if query is None:
-            query = [None, now(), code]
-            # TODO send query
-            self._queries.append(query)
-        suspend, resume = tasko.suspend()
-        query.append(resume)
-        await suspend
-        if query[0] is None:
-            raise RuntimeError("register {0} timeout".format(code))
-        return query[0]
+    def refresh(self):
+        prev_data = self._data
 
-    def register_value(self, code: int, refresh_ms=500):
-        r = self._lookup_query(code | CMD_GET_REG, refresh_ms)
-        if r is None:
-            return None
-        else:
-            return r[0]
+        def final_check():
+            if prev_data is self._data:
+                # if we still didn't get any data, emit "change" event, so that queries can time out
+                self._data = None
+                self.emit(EV_CHANGE, None)
+
+        def second_refresh():
+            if prev_data is self._data:
+                self._query()
+                delayed_callback(0.100, final_check)
+
+        def first_refresh():
+            if prev_data is self._data:
+                self._query()
+                delayed_callback(0.050, second_refresh)
+
+        self._query()
+        delayed_callback(0.020, first_refresh)
+
+    async def query(self, refresh_ms=500):
+        curr = self.current(refresh_ms)
+        if curr:
+            return curr
+        self.refresh()
+        await self.event(EV_CHANGE)
+        if self._data is None:
+            raise RuntimeError("Can't read reg #{} (from {})",
+                               self.code, self.client)
+        return self._data
+
+    def handle_packet(self, pkt: JDPacket):
+        if pkt.is_reg_get and pkt.reg_code == self.code:
+            self._data = pkt.data
+            self.emit(EV_CHANGE, self._data)
+
+
+class Server(EventEmitter):
+    def __init__(self) -> None:
+        self.running = False
+        self.service_class = 0
+        self.service_index = None
+
+    def handle_packet(self, pkt: JDPacket):
+        pass
 
     def handle_packet_outer(self, pkt: JDPacket):
+        # TODO
+        self.handle_packet(pkt)
+
+
+class Client(EventEmitter):
+    def __init__(self, bus: Bus, service_class: int, role: str) -> None:
+        self.bus = bus
+        self.broadcast = False
+        self.service_class = service_class
+        self.service_index = None
+        self.device: 'Device' = None
+        self.current_device: 'Device' = None
+        self.role = role
+        self._registers: list[RawRegisterClient] = []
+        bus.unattached_clients.append(self)
+        bus.all_clients.append(self)
+
+    def _lookup_register(self, code: int):
+        for reg in self._registers:
+            if reg.code == code:
+                return reg
+        return None
+
+    def register(self, code: int):
+        r = self._lookup_register(code)
+        if r is None:
+            r = RawRegisterClient(self, code)
+            self._registers.append(r)
+        return r
+
+    def handle_packet(self, pkt: JDPacket):
         pass
+
+    def handle_packet_outer(self, pkt: JDPacket):
+        if pkt.is_reg_get:
+            r = self._lookup_register(pkt.reg_code)
+            if r is not None:
+                r.handle_packet(pkt)
+        self.handle_packet(pkt)
+
+    def send_cmd(self, pkt: JDPacket):
+        if self.current_device is None:
+            return
+        pkt.service_index = self.service_index
+        pkt.device_identifier = self.current_device.device_id
+        pkt._header[3] |= JD_FRAME_FLAG_COMMAND
+        self.bus._send_core(pkt)
+
+    def on_attach(self):
+        pass
+
+    def _attach(self, dev: 'Device', service_idx: int):
+        assert self.device is None
+        if not self.broadcast:
+            if not dev.matches_role_at(self.role, service_idx):
+                return False
+            self.device = dev
+            self.service_index = service_idx
+            self.bus.unattached_clients.remove(self)
+        log("attached {}/{} to client {}", dev, service_idx, self.role)
+        dev.clients.append(self)
+        self.emit(EV_CONNECTED)
+        return True
+
+    def _detach(self):
+        log("detached {}", self.role)
+        self.service_index = None
+        if not self.broadcast:
+            assert self.device
+            self.device = None
+            self.bus.unattached_clients.append(self)
+            self.bus.clear_attach_cache()
+        self.emit(EV_DISCONNECTED)
 
 
 class Device(EventEmitter):
@@ -312,7 +566,15 @@ class Device(EventEmitter):
         self.clients: list[Client] = []
         self.last_seen = now()
         self._event_counter: int = None
+        self._ctrl_client: Client = None
         bus.devices.append(self)
+
+    @property
+    def ctrl_client(self):
+        if self._ctrl_client is None:
+            self._ctrl_client = Client(self.bus, 0, "")
+            self._ctrl_client._attach(self, 0)
+        return self._ctrl_client
 
     @property
     def announce_flags(self):
@@ -344,9 +606,21 @@ class Device(EventEmitter):
             return None
         return u32(self.services, idx << 2)
 
+    def matches_role_at(self, role: str, service_idx: int):
+        if not role or role == self.device_id or role == self.device_id + ":" + service_idx:
+            return True
+        return True
+        # return jacdac._rolemgr.getRole(self.deviceId, serviceIdx) == role
+
     @property
     def num_service_classes(self):
         return len(self.services) >> 2
+
+    def _destroy(self):
+        log("destroy " + self.short_id)
+        for c in self.clients:
+            c._detach()
+        self.clients = None
 
     def process_packet(self, pkt: JDPacket):
         self.last_seen = now()
@@ -375,138 +649,15 @@ class Device(EventEmitter):
             self.bus.emit(EV_EVENT, pkt)
             self._event_counter = pkt.event_counter
 
-        client = next(c for c in self.clients if
-                      (c.service_class == service_class if c.broadcast else c.service_index == pkt.service_index), None)
-
-        if client:
-            # log(`handle pkt at ${client.role} rep=${pkt.serviceCommand}`)
-            client.current_device = self
-            client.handle_packet_outer(pkt)
+        for c in self.clients:
+            if (c.broadcast and c.service_class == service_class) or \
+               (not c.broadcast and c.service_index == pkt.service_index):
+                # log(`handle pkt at ${client.role} rep=${pkt.serviceCommand}`)
+                c.current_device = self
+                c.handle_packet_outer(pkt)
 
 
 """
-
-    export class Device extends EventSource {
-        lastSeen: number
-        clients: Client[] = []
-        private _event_counter: number
-        private _shortId: string
-        private queries: RegQuery[]
-        _score: number
-
-        matchesRoleAt(role: string, serviceIdx: number) {
-            if (!role) return true
-
-            if (role == self.deviceId) return true
-            if (role == self.deviceId + ":" + serviceIdx) return true
-
-            return jacdac._rolemgr.getRole(self.deviceId, serviceIdx) == role
-        }
-
-        private lookupQuery(reg: number) {
-            if (!self.queries) self.queries = []
-            return self.queries.find(q => q.reg == reg)
-        }
-
-        queryInt(reg: number, refreshRate = 1000) {
-            const v = self.query(reg, refreshRate)
-            if (!v) return undefined
-            return intOfBuffer(v)
-        }
-
-        query(reg: number, refreshRate = 1000) {
-            let q = self.lookupQuery(reg)
-            if (!q) self.queries.push((q = new RegQuery(reg)))
-
-            const now = control.millis()
-            if (
-                !q.lastQuery ||
-                (q.value === undefined && now - q.lastQuery > 500) ||
-                (refreshRate != null && now - q.lastQuery > refreshRate)
-            ) {
-                q.lastQuery = now
-                self.sendCtrlCommand(CMD_GET_REG | reg)
-            }
-            return q.value
-        }
-
-        get uptime(): number {
-            // create query
-            self.query(ControlReg.Uptime, 60000)
-            const q = self.lookupQuery(ControlReg.Uptime)
-            if (q.value) {
-                const up = q.value.getNumber(NumberFormat.UInt32LE, 0)
-                const offset = (control.millis() - q.lastReport) * 1000
-                return up + offset
-            }
-            return undefined
-        }
-
-        get mcuTemperature(): number {
-            return self.queryInt(ControlReg.McuTemperature)
-        }
-
-        get firmwareVersion(): string {
-            const b = self.query(ControlReg.FirmwareVersion, null)
-            if (b) return b.toString()
-            else return ""
-        }
-
-        get firmwareUrl(): string {
-            const b = self.query(ControlReg.FirmwareUrl, null)
-            if (b) return b.toString()
-            else return ""
-        }
-
-        get deviceUrl(): string {
-            const b = self.query(ControlReg.DeviceUrl, null)
-            if (b) return b.toString()
-            else return ""
-        }
-
-        handleCtrlReport(pkt: JDPacket) {
-            self.lastSeen = control.millis()
-            if (pkt.isRegGet) {
-                const reg = pkt.regCode
-                const q = self.lookupQuery(reg)
-                if (q) {
-                    q.value = pkt.data
-                    q.lastReport = control.millis()
-                }
-            }
-        }
-
-        hasService(service_class: number) {
-            const n = self.serviceClassLength
-            for (let i = 0; i < n; ++i)
-                if (self.serviceClassAt(i) === service_class) return true
-            return false
-        }
-
-        clientAtServiceIndex(service_index: number) {
-            for (const c of self.clients) {
-                if (c.device == self && c.service_index == service_index) return c
-            }
-            return null
-        }
-
-        sendCtrlCommand(cmd: number, payload: Buffer = null) {
-            const pkt = !payload
-                ? JDPacket.onlyHeader(cmd)
-                : JDPacket.from(cmd, payload)
-            pkt.service_index = JD_SERVICE_INDEX_CTRL
-            pkt._sendCmd(self)
-        }
-
-        _destroy() {
-            log("destroy " + self.shortId)
-            for (let c of self.clients) c._detach()
-            self.clients = null
-        }
-    }
-
-
-
 
 ackAwaiters: list[AckAwaiter] = []
 
