@@ -6,6 +6,7 @@ import microcontroller
 import supervisor
 import ubinascii
 import tasko
+import ctrl
 
 JD_SERIAL_HEADER_SIZE = const(16)
 JD_SERIAL_MAX_PAYLOAD_SIZE = const(236)
@@ -25,6 +26,42 @@ JD_FRAME_FLAG_IDENTIFIER_IS_SERVICE_CLASS = const(0x04)
 # Registers 0x180-0x1ff - r/o defined per-service
 # Registers 0x200-0xeff - custom, defined per-service
 # Registers 0xf00-0xfff - reserved for implementation, should not be on the wire
+
+_JD_READING_THRESHOLD_NEUTRAL = const(0x1)
+_JD_READING_THRESHOLD_INACTIVE = const(0x2)
+_JD_READING_THRESHOLD_ACTIVE = const(0x3)
+_JD_STATUS_CODES_READY = const(0x0)
+_JD_STATUS_CODES_INITIALIZING = const(0x1)
+_JD_STATUS_CODES_CALIBRATING = const(0x2)
+_JD_STATUS_CODES_SLEEPING = const(0x3)
+_JD_STATUS_CODES_WAITING_FOR_INPUT = const(0x4)
+_JD_STATUS_CODES_CALIBRATION_NEEDED = const(0x64)
+_JD_CMD_ANNOUNCE = const(0x0)
+_JD_CMD_EVENT = const(0x1)
+_JD_CMD_CALIBRATE = const(0x2)
+_JD_REG_INTENSITY = const(0x1)
+_JD_REG_VALUE = const(0x2)
+_JD_REG_MIN_VALUE = const(0x110)
+_JD_REG_MAX_VALUE = const(0x111)
+_JD_REG_MAX_POWER = const(0x7)
+_JD_REG_STREAMING_SAMPLES = const(0x3)
+_JD_REG_STREAMING_INTERVAL = const(0x4)
+_JD_REG_READING = const(0x101)
+_JD_REG_MIN_READING = const(0x104)
+_JD_REG_MAX_READING = const(0x105)
+_JD_REG_READING_ERROR = const(0x106)
+_JD_REG_READING_RESOLUTION = const(0x108)
+_JD_REG_INACTIVE_THRESHOLD = const(0x5)
+_JD_REG_ACTIVE_THRESHOLD = const(0x6)
+_JD_REG_STREAMING_PREFERRED_INTERVAL = const(0x102)
+_JD_REG_VARIANT = const(0x107)
+_JD_REG_STATUS_CODE = const(0x103)
+_JD_REG_INSTANCE_NAME = const(0x109)
+_JD_EV_ACTIVE = const(0x1)
+_JD_EV_INACTIVE = const(0x2)
+_JD_EV_CHANGE = const(0x3)
+_JD_EV_STATUS_CODE_CHANGED = const(0x4)
+_JD_EV_NEUTRAL = const(0x7)
 
 CMD_GET_REG = const(0x1000)
 CMD_SET_REG = const(0x2000)
@@ -96,24 +133,33 @@ def now():
 def unpack(buf: bytes, fmt: str = None):
     if fmt is None or buf is None:
         return buf
-    return struct.unpack(fmt, buf)
+    return struct.unpack("<" + fmt, buf)
 
 
 def pack(fmt: str, *args):
-    return struct.pack(fmt, *args)
+    if len(args) == 1 and isinstance(args[1], tuple):
+        args = args[1]
+    return struct.pack("<" + fmt, *args)
 
 
 class JDPacket:
-    def __init__(self, *, cmd: int = None, size: int = 0, frombytes: bytes = None) -> None:
+    def __init__(self, *, cmd: int = None, size: int = 0, frombytes: bytes = None, data: bytearray = None) -> None:
         self.timestamp = now()
         if frombytes is None:
             self._header = bytearray(JD_SERIAL_HEADER_SIZE)
-            self._data = bytearray(size)
+            self._data = data or bytearray(size)
         else:
             self._header = bytearray(frombytes[0:JD_SERIAL_HEADER_SIZE])
             self._data = bytearray(frombytes[JD_SERIAL_HEADER_SIZE:])
         if cmd is not None:
             self.service_command = cmd
+
+    @staticmethod
+    def pack(cmd: int, fmt: str, *args):
+        return JDPacket(cmd=cmd, data=pack(fmt, *args))
+
+    def unpack(self, fmt: str):
+        return unpack(self.data, fmt)
 
     @property
     def service_command(self):
@@ -234,6 +280,17 @@ class JDPacket:
         return "<JDPacket {}>".format(self.to_string())
 
 
+def _execute(fn, args):
+    async def later():
+        if hasattr(fn, "__await__"):
+            await fn
+        else:
+            res = fn(*args)
+            if hasattr(res, "__await__"):
+                await res
+    tasko.add_task(later)
+
+
 class EventEmitter:
     def emit(self, id: str, *args):
         if not hasattr(self, "_listeners"):
@@ -241,7 +298,7 @@ class EventEmitter:
         # copy list before iteration, in case it's modified
         for lid, fn in self._listeners[:]:
             if lid == id:
-                fn(*args)
+                _execute(fn, args)
 
     def _init_emitter(self):
         if not hasattr(self, "_listeners"):
@@ -288,7 +345,7 @@ class Bus(EventEmitter):
         self.unattached_clients: list['Client'] = []
         self.all_clients: list['Client'] = []
         self.self_device = Device(self, "1234aabbccdd9900", bytearray(4))
-        self.host_services: list['Server'] = []
+        self.servers: list['Server'] = []
 
     def process_packet(self, pkt: JDPacket):
         pass
@@ -300,6 +357,18 @@ class Bus(EventEmitter):
 
     def clear_attach_cache(self):
         pass
+
+    def mk_event_cmd(self, ev_code: int):
+        if not self._event_counter:
+            self._event_counter = 0
+        self._event_counter = (self._event_counter +
+                               1) & CMD_EVENT_COUNTER_MASK
+        assert (ev_code >> 8) == 0
+        return (
+            CMD_EVENT_MASK |
+            (self._event_counter << CMD_EVENT_COUNTER_POS) |
+            ev_code
+        )
 
     def _reattach(self, dev: 'Device'):
         dev.last_seen = now()
@@ -353,14 +422,14 @@ class Bus(EventEmitter):
         if multi_command_class != None:
             if not pkt.is_command:
                 return  # only commands supported in multi-command
-            for h in self.host_services:
+            for h in self.servers:
                 if h.service_class == multi_command_class and h.running:
                     # pretend it's directly addressed to us
                     pkt.device_identifier = self.self_device.device_id
                     pkt.service_index = h.service_index
                     h.handle_packet_outer(pkt)
         elif dev_id == self.self_device.device_id and pkt.is_command:
-            h = self.host_services[pkt.service_index]
+            h = self.servers[pkt.service_index]
             if h and h.running:
                 # log(`handle pkt at ${h.name} cmd=${pkt.service_command}`)
                 h.handle_packet_outer(pkt)
@@ -407,8 +476,6 @@ class Bus(EventEmitter):
 
             dev.process_packet(pkt)
 
-
-_JD_CONTROL_ANNOUNCE_FLAGS_RESTART_COUNTER_STEADY = const(0xf)
 
 
 def delayed_callback(seconds, fn):
@@ -474,17 +541,93 @@ class RawRegisterClient(EventEmitter):
 
 
 class Server(EventEmitter):
-    def __init__(self) -> None:
-        self.running = False
-        self.service_class = 0
+    def __init__(self, bus: Bus, service_class: int) -> None:
+        self.service_class = service_class
+        self.instance_name: str = None
         self.service_index = None
+        self.bus = bus
+        self._status_code = 0  # u16, u16
+        self.service_index = len(self.bus.servers)
+        self.bus.servers.append(self)
 
     def handle_packet(self, pkt: JDPacket):
         pass
 
+    def status_code(self):
+        return self._status_code
+
+    def set_status_code(self, code: int, vendor_code: int):
+        c = ((code & 0xffff) << 16) | (vendor_code & 0xffff)
+        if c != self._status_code:
+            self._status_code = c
+            self.send_change_event()
+
     def handle_packet_outer(self, pkt: JDPacket):
-        # TODO
-        self.handle_packet(pkt)
+        cmd = pkt.service_command
+        if cmd == _JD_REG_STATUS_CODE | CMD_GET_REG:
+            self.handle_status_code(pkt)
+        elif cmd == _JD_REG_INSTANCE_NAME | CMD_GET_REG:
+            self.handle_instance_name(pkt)
+        else:
+            # self.state_updated = False
+            self.handle_packet(pkt)
+
+    def handle_packet(self, pkt: JDPacket):
+        pass
+
+    def send_report(self, pkt: JDPacket):
+        pkt.service_index = self.service_index
+        pkt.device_identifier = self.bus.self_device.device_id
+        self.bus._send_core(pkt)
+
+    def send_event(self, event_code: int, data: bytearray = None):
+        pkt = JDPacket(cmd=self.bus.mk_event_cmd(event_code), data=data)
+        def resend(): self.send_report(pkt)
+        resend()
+        delayed_callback(0.020, resend)
+        delayed_callback(0.100, resend)
+
+    def send_change_event(self):
+        self.send_event(_JD_EV_CHANGE)
+        self.emit(EV_CHANGE)
+
+    def handle_status_code(self, pkt: JDPacket):
+        self.handle_reg_u32(pkt, _JD_REG_STATUS_CODE, self._status_code)
+
+    def handle_reg_u32(self, pkt: JDPacket, register: int, current: int):
+        return self.handle_reg(pkt, register, "I", current)
+
+    def handle_reg_i32(self, pkt: JDPacket, register: int, current: int):
+        return self.handle_reg(pkt, register, "i", current)
+
+    def handle_reg(self, pkt: JDPacket, register: int, fmt: str, current):
+        getset = pkt.service_command >> 12
+        if getset == 0 or getset > 2:
+            return current
+        reg = pkt.service_command & 0xfff
+        if reg != register:
+            return current
+        if getset == 1:
+            self.send_report(JDPacket.pack(pkt.service_command, fmt, current))
+        else:
+            if register >> 8 == 0x1:
+                return current  # read-only
+            v = pkt.unpack(fmt)
+            if not isinstance(current, tuple):
+                v = v[0]
+            if v != current:
+                self.state_updated = True
+                current = v
+        return current
+
+    def handle_instance_name(self, pkt: JDPacket):
+        self.send_report(JDPacket(cmd=pkt.service_command,
+                         data=bytearray(self.instance_name, "utf-8")))
+
+    def log(self, text: str, *args):
+        prefix = "{}.{}>".format(self.bus.self_device,
+                                 self.instance_name or self.service_index)
+        log(prefix + text, *args)
 
 
 class Client(EventEmitter):
@@ -556,6 +699,9 @@ class Client(EventEmitter):
             self.bus.unattached_clients.append(self)
             self.bus.clear_attach_cache()
         self.emit(EV_DISCONNECTED)
+
+
+_JD_CONTROL_ANNOUNCE_FLAGS_RESTART_COUNTER_STEADY = const(0xf)
 
 
 class Device(EventEmitter):
