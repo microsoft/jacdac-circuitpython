@@ -4,5 +4,8 @@ MPYC=../../circuitpython/mpy-cross/mpy-cross
 set -e
 set -x
 
-$MPYC jacdac.py
-cp code.py jacdac.py /Volumes/CIRCUITPY/
+# just validete with mpy-cross
+$MPYC jacdac/*.py
+rm -f jacdac/*.mpy
+
+cp -r code.py jacdac /Volumes/CIRCUITPY/

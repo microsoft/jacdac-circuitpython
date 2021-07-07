@@ -1,4 +1,6 @@
-from jacdac import *
+import jacdac as jd
+import time
+import microcontroller
 from micropython import const
 
 _JD_SERVICE_CLASS_CONTROL = const(0x0)
@@ -33,8 +35,8 @@ _JD_CONTROL_REG_DEVICE_SPECIFICATION_URL = const(0x189)
 _JD_CONTROL_REG_FIRMWARE_URL = const(0x188)
 
 
-class CtrlServer(Server):
-    def __init__(self, bus: Bus) -> None:
+class CtrlServer(jd.Server):
+    def __init__(self, bus: jd.Bus) -> None:
         super().__init__(bus, 0)
         self.restart_counter = 0
 
@@ -49,10 +51,10 @@ class CtrlServer(Server):
             _JD_CONTROL_ANNOUNCE_FLAGS_SUPPORTS_BROADCAST |
             _JD_CONTROL_ANNOUNCE_FLAGS_SUPPORTS_FRAMES
         )
-        buf = pack("%dI" % len(ids), ids)
-        self.send_report(JDPacket(cmd=0, data=buf))
+        buf = jd.pack("%dI" % len(ids), ids)
+        self.send_report(jd.JDPacket(cmd=0, data=buf))
 
-        self.bus.emit(EV_SELF_ANNOUNCE)
+        self.bus.emit(jd.EV_SELF_ANNOUNCE)
         # self.gc_devices()
 
         # auto bind
@@ -62,3 +64,39 @@ class CtrlServer(Server):
         #     if self.auto_bind_cnt >= 2:
         #         self.auto_bind_cnt = 0
         #         jacdac.role_manager_server.bind_roles()
+
+    # def handle_flood_ping(self, pkt: jd.JDPacket):
+    #     num_responses, counter, size = pkt.unpack("IIB")
+    #     payload = bytearray(4 + size)
+    #     for i in range(size): payload[4+i]=i
+    #     def queue_ping():
+    #         if num_responses <= 0:
+    #             control.internal_on_event(
+    #                 jacdac.__physId(),
+    #                 EVT_TX_EMPTY,
+    #                 do_nothing
+    #             )
+    #         else:
+    #             payload.set_number(NumberFormat.UInt32LE, 0, counter)
+    #             self.send_report(
+    #                 JDPacket.from(ControlCmd.FloodPing, payload)
+    #             )
+    #             num_responses--
+    #             counter++
+    #     control.internal_on_event(jacdac.__physId(), EVT_TX_EMPTY, queue_ping)
+    #     queue_ping()
+
+    def handle_packet(self, pkt: jd.JDPacket):
+        if pkt.is_reg_get:
+            if pkt.reg_code == _JD_CONTROL_REG_UPTIME:
+                self.send_report(jd.JDPacket.packed(
+                    jd.CMD_GET_REG | _JD_CONTROL_REG_UPTIME, "Q",  time.monotonic_ns()/1000))
+        else:
+            cmd = pkt.service_command
+            if cmd == _JD_CONTROL_CMD_SERVICES:
+                self.queue_announce()
+            elif cmd == _JD_CONTROL_CMD_IDENTIFY:
+                self.log("identify")
+                self.bus.emit(jd.EV_IDENTIFY)
+            elif cmd == _JD_CONTROL_CMD_RESET:
+                microcontroller.reset()

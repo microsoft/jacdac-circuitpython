@@ -5,8 +5,10 @@ import struct
 import microcontroller
 import supervisor
 import ubinascii
+
 import tasko
-import ctrl
+
+from .ctrl import CtrlServer as _CtrlServer
 
 JD_SERIAL_HEADER_SIZE = const(16)
 JD_SERIAL_MAX_PAYLOAD_SIZE = const(236)
@@ -122,10 +124,9 @@ def log(msg: str, *args):
         msg = msg.format(*args)
     print("JD: " + msg)
 
-# TODO implement this in C for half-decent precision
-
 
 def now():
+    # TODO implement this in C for half-decent precision
     return int(time.monotonic() * 1000)
 
 
@@ -340,12 +341,19 @@ def _service_matches(dev: 'Device', serv: bytearray):
 
 
 class Bus(EventEmitter):
-    def __init__(self) -> None:
+    def __init__(self, pin) -> None:
         self.devices: list['Device'] = []
         self.unattached_clients: list['Client'] = []
         self.all_clients: list['Client'] = []
         self.self_device = Device(self, "1234aabbccdd9900", bytearray(4))
         self.servers: list['Server'] = []
+        self.busio = JACDAC(pin)
+
+        ctrl = _CtrlServer(self)  # attach control server
+
+        async def announce():
+            ctrl.queue_announce()
+        tasko.schedule(0.5, announce())
 
     def process_packet(self, pkt: JDPacket):
         pass
@@ -475,7 +483,6 @@ class Bus(EventEmitter):
                 return
 
             dev.process_packet(pkt)
-
 
 
 def delayed_callback(seconds, fn):
@@ -801,161 +808,3 @@ class Device(EventEmitter):
                 # log(`handle pkt at ${client.role} rep=${pkt.serviceCommand}`)
                 c.current_device = self
                 c.handle_packet_outer(pkt)
-
-
-"""
-
-ackAwaiters: list[AckAwaiter] = []
-
-        jdunpack<T extends any[]>(fmt: string): T {
-            const p = self._data && fmt && jdunpack<T>(self._data, fmt)
-            return (p || []) as T
-        }
-
-        compress(stripped: Buffer[]) {
-            if (stripped.length == 0) return
-            let sz = -4
-            for (let s of stripped) {
-                sz += s.length
-            }
-            const data = Buffer.create(sz)
-            self._header.write(12, stripped[0])
-            data.write(0, stripped[0].slice(4))
-            sz = stripped[0].length - 4
-            for (let s of stripped.slice(1)) {
-                data.write(sz, s)
-                sz += s.length
-            }
-            self.data = data
-        }
-
-        withFrameStripped() {
-            return self._header.slice(12, 4).concat(self._data)
-        }
-
-        getNumber(fmt: NumberFormat, offset: number) {
-            return self._data.getNumber(fmt, offset)
-        }
-
-        jdpack(fmt: string, nums: any[]) {
-            self.data = jdpack(fmt, nums)
-        }
-
-
-        _sendCore() {
-            if (self._data.length != self._header[12]) throw "jdsize mismatch"
-            jacdac.__physSendPacket(self._header, self._data)
-            bus.processPacket(self) // handle loop-back packet
-        }
-
-        _sendReport(dev: Device) {
-            if (!dev) return
-            self.deviceIdentifier = dev.deviceId
-            self._sendCore()
-        }
-
-        _sendCmd(dev: Device) {
-            if (!dev) return
-            self._sendCmdId(dev.deviceId)
-        }
-
-        _sendCmdId(devId: string) {
-            if (!devId) return
-            self.deviceIdentifier = devId
-            self._header[3] |= JD_FRAME_FLAG_COMMAND
-            self._sendCore()
-        }
-
-        sendAsMultiCommand(service_class: number) {
-            self._header[3] |=
-                JD_FRAME_FLAG_IDENTIFIER_IS_SERVICE_CLASS |
-                JD_FRAME_FLAG_COMMAND
-            self._header.setNumber(NumberFormat.UInt32LE, 4, service_class)
-            self._header.setNumber(NumberFormat.UInt32LE, 8, 0)
-            self._sendCore()
-        }
-
-        // returns true when sent and received
-        _sendWithAck(devId: string) {
-            if (!devId) return false
-            self.requiresAck = true
-            self._sendCmdId(devId)
-
-            if (!ackAwaiters) {
-                ackAwaiters = []
-                control.runInParallel(() => {
-                    while (1) {
-                        pause(Math.randomRange(20, 50))
-                        checkAckAwaiters()
-                    }
-                })
-            }
-
-            const aw = new AckAwaiter(self, devId)
-            ackAwaiters.push(aw)
-            while (aw.nextRetry > 0)
-                control.waitForEvent(DAL.DEVICE_ID_NOTIFY, aw.eventId)
-            return aw.nextRetry == 0
-        }
-
-        static jdpacked(service_command: number, fmt: string, nums: any[]) {
-            return JDPacket.from(service_command, jdpack(fmt, nums))
-        }
-
-        static segmentData(data: Buffer) {
-            if (data.length <= JD_SERIAL_MAX_PAYLOAD_SIZE) return [data]
-            const res: Buffer[] = []
-            for (let i = 0; i < data.length; i += JD_SERIAL_MAX_PAYLOAD_SIZE)
-                res.push(data.slice(i, JD_SERIAL_MAX_PAYLOAD_SIZE))
-            return res
-        }
-    }
-
-    class AckAwaiter {
-        nextRetry: number
-        numTries = 1
-        readonly crc: number
-        readonly eventId: number
-        constructor(
-            public readonly pkt: JDPacket,
-            public readonly srcId: string
-        ) {
-            self.crc = pkt.crc
-            self.nextRetry = control.millis() + ACK_DELAY
-            self.eventId = control.allocateNotifyEvent()
-        }
-    }
-
-    function checkAckAwaiters() {
-        const now = control.millis()
-        const toRetry = ackAwaiters.filter(a => now > a.nextRetry)
-        if (!toRetry.length) return
-        for (let a of toRetry) {
-            if (a.nextRetry == 0) continue // already got ack
-            if (a.numTries >= ACK_RETRIES) {
-                a.nextRetry = -1
-                control.raiseEvent(DAL.DEVICE_ID_NOTIFY, a.eventId)
-            } else {
-                a.numTries++
-                a.nextRetry = now + a.numTries * ACK_DELAY
-                a.pkt._sendCore()
-            }
-        }
-        ackAwaiters = ackAwaiters.filter(a => a.nextRetry > 0)
-    }
-
-    export function _gotAck(pkt: JDPacket) {
-        if (!ackAwaiters) return
-        let numNotify = 0
-        const srcId = pkt.deviceIdentifier
-        const crc = pkt.service_command
-        for (let a of ackAwaiters) {
-            if (a.crc == crc && a.srcId == srcId) {
-                a.nextRetry = 0
-                control.raiseEvent(DAL.DEVICE_ID_NOTIFY, a.eventId)
-                numNotify++
-            }
-        }
-        if (numNotify) ackAwaiters = ackAwaiters.filter(a => a.nextRetry !== 0)
-    }
-"""
