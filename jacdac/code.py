@@ -10,3 +10,4 @@ if not q.value:
 else:
     print("auto-start normal")
     import jacdac
+    jacdac.Bus(board.IO18)

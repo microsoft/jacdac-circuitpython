@@ -1,14 +1,13 @@
-from busio import JACDAC
+import busio
 from micropython import const
 import time
-import struct
-import microcontroller
-import supervisor
 import ubinascii
 
 import tasko
 
-from .ctrl import CtrlServer as _CtrlServer
+from . import ctrl
+from . import util
+
 
 JD_SERIAL_HEADER_SIZE = const(16)
 JD_SERIAL_MAX_PAYLOAD_SIZE = const(236)
@@ -74,49 +73,24 @@ CMD_EVENT_CODE_MASK = const(0xff)
 CMD_EVENT_COUNTER_MASK = const(0x7f)
 CMD_EVENT_COUNTER_POS = const(8)
 
-EV_CHANGE = const("change")
-EV_DEVICE_CONNECT = const("deviceConnect")
-EV_DEVICE_CHANGE = const("deviceChange")
-EV_DEVICE_ANNOUNCE = const("deviceAnnounce")
-EV_SELF_ANNOUNCE = const("selfAnnounce")
-EV_PACKET_PROCESS = const("packetProcess")
-EV_REPORT_RECEIVE = const("reportReceive")
-EV_REPORT_UPDATE = const("reportUpdate")
-EV_RESTART = const("restart")
-EV_PACKET_RECEIVE = const("packetReceive")
-EV_EVENT = const("packetEvent")
-EV_STATUS_EVENT = const("statusEvent")
-EV_IDENTIFY = const("identify")
-EV_CONNECTED = const("connected")
-EV_DISCONNECTED = const("disconnected")
+EV_CHANGE = "change"
+EV_DEVICE_CONNECT = "deviceConnect"
+EV_DEVICE_CHANGE = "deviceChange"
+EV_DEVICE_ANNOUNCE = "deviceAnnounce"
+EV_SELF_ANNOUNCE = "selfAnnounce"
+EV_PACKET_PROCESS = "packetProcess"
+EV_REPORT_RECEIVE = "reportReceive"
+EV_REPORT_UPDATE = "reportUpdate"
+EV_RESTART = "restart"
+EV_PACKET_RECEIVE = "packetReceive"
+EV_EVENT = "packetEvent"
+EV_STATUS_EVENT = "statusEvent"
+EV_IDENTIFY = "identify"
+EV_CONNECTED = "connected"
+EV_DISCONNECTED = "disconnected"
 
 _ACK_RETRIES = const(4)
 _ACK_DELAY = const(40)
-
-
-def hex_num(n: int, len=8):
-    hex = "0123456789abcdef"
-    r = "0x"
-    for i in range(len):
-        r += hex[(n >> ((len - 1 - i) * 4)) & 0xf]
-    return r
-
-
-def buf2hex(buf: bytes):
-    return str(ubinascii.hexlify(buf), "utf-8")
-
-
-def u16(buf: bytes, off: int):
-    return buf[off] | (buf[off+1] << 8)
-
-
-def set_u16(buf: bytearray, off: int, val: int):
-    buf[off] = val & 0xff
-    buf[off + 1] = val >> 8
-
-
-def u32(buf: bytes, off: int):
-    return buf[off] | (buf[off+1] << 8) | (buf[off+2] << 16) | (buf[off+3] << 24)
 
 
 def log(msg: str, *args):
@@ -128,19 +102,6 @@ def log(msg: str, *args):
 def now():
     # TODO implement this in C for half-decent precision
     return int(time.monotonic() * 1000)
-
-
-# TODO would we want the "u32 u16" kind of format strings?
-def unpack(buf: bytes, fmt: str = None):
-    if fmt is None or buf is None:
-        return buf
-    return struct.unpack("<" + fmt, buf)
-
-
-def pack(fmt: str, *args):
-    if len(args) == 1 and isinstance(args[1], tuple):
-        args = args[1]
-    return struct.pack("<" + fmt, *args)
 
 
 class JDPacket:
@@ -156,23 +117,23 @@ class JDPacket:
             self.service_command = cmd
 
     @staticmethod
-    def pack(cmd: int, fmt: str, *args):
-        return JDPacket(cmd=cmd, data=pack(fmt, *args))
+    def packed(cmd: int, fmt: str, *args):
+        return JDPacket(cmd=cmd, data=util.pack(fmt, *args))
 
     def unpack(self, fmt: str):
-        return unpack(self.data, fmt)
+        return util.unpack(self.data, fmt)
 
     @property
     def service_command(self):
-        return u16(self._header, 14)
+        return util.u16(self._header, 14)
 
     @service_command.setter
     def service_command(self, cmd: int):
-        set_u16(self._header, 14, cmd)
+        util.set_u16(self._header, 14, cmd)
 
     @property
     def device_identifier(self) -> str:
-        return buf2hex(self._header[4:12])
+        return util.buf2hex(self._header[4:12])
 
     @device_identifier.setter
     def device_identifier(self, id: str):
@@ -188,7 +149,7 @@ class JDPacket:
     @property
     def multicommand_class(self):
         if self.packet_flags & JD_FRAME_FLAG_IDENTIFIER_IS_SERVICE_CLASS:
-            return u32(self._header, 4)
+            return util.u32(self._header, 4)
 
     @property
     def size(self):
@@ -215,7 +176,7 @@ class JDPacket:
 
     @property
     def crc(self):
-        return u16(self._header, 0)
+        return util.u16(self._header, 0)
 
     @property
     def is_event(self):
@@ -269,12 +230,12 @@ class JDPacket:
             self.device_identifier,
             self.service_index,
             self.packet_flags,
-            hex_num(self.service_command, 4),
+            util.hex_num(self.service_command, 4),
             self.size)
         if self.size < 20:
-            msg += ": " + buf2hex(self.data)
+            msg += ": " + util.buf2hex(self.data)
         else:
-            msg += ": " + buf2hex(self.data[0:20]) + "..."
+            msg += ": " + util.buf2hex(self.data[0:20]) + "..."
         return msg
 
     def __str__(self):
@@ -347,13 +308,12 @@ class Bus(EventEmitter):
         self.all_clients: list['Client'] = []
         self.self_device = Device(self, "1234aabbccdd9900", bytearray(4))
         self.servers: list['Server'] = []
-        self.busio = JACDAC(pin)
+        self.busio = busio.JACDAC(pin)
 
-        ctrl = _CtrlServer(self)  # attach control server
-
+        ctrls = ctrl.CtrlServer(self)  # attach control server
         async def announce():
-            ctrl.queue_announce()
-        tasko.schedule(0.5, announce())
+            ctrls.queue_announce()
+        tasko.schedule(2, announce())
 
     def process_packet(self, pkt: JDPacket):
         pass
@@ -615,7 +575,7 @@ class Server(EventEmitter):
         if reg != register:
             return current
         if getset == 1:
-            self.send_report(JDPacket.pack(pkt.service_command, fmt, current))
+            self.send_report(JDPacket.packed(pkt.service_command, fmt, current))
         else:
             if register >> 8 == 0x1:
                 return current  # read-only
@@ -731,7 +691,7 @@ class Device(EventEmitter):
 
     @property
     def announce_flags(self):
-        return u16(self.services, 0)
+        return util.u16(self.services, 0)
 
     @property
     def reset_count(self):
@@ -757,7 +717,7 @@ class Device(EventEmitter):
             return 0
         if idx < 0 or idx >= self.num_service_classes:
             return None
-        return u32(self.services, idx << 2)
+        return util.u32(self.services, idx << 2)
 
     def matches_role_at(self, role: str, service_idx: int):
         if not role or role == self.device_id or role == self.device_id + ":" + service_idx:
