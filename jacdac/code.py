@@ -11,3 +11,5 @@ else:
     print("auto-start normal")
     import jacdac
     jacdac.Bus(board.IO18)
+    import tasko
+    tasko.run()

@@ -47,6 +47,6 @@ def unpack(buf: bytes, fmt: str = None):
 
 
 def pack(fmt: str, *args):
-    if len(args) == 1 and isinstance(args[1], tuple):
-        args = args[1]
+    if len(args) == 1 and isinstance(args[0], (tuple, list)):
+        args = args[0]
     return struct.pack("<" + fmt, *args)

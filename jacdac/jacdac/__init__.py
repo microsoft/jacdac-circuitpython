@@ -4,7 +4,6 @@ import time
 
 import tasko
 
-from . import ctrl
 from . import util
 
 
@@ -108,10 +107,10 @@ class JDPacket:
         self.timestamp = now()
         if frombytes is None:
             self._header = bytearray(JD_SERIAL_HEADER_SIZE)
-            self._data = data or bytearray(size)
+            self.data = data or bytearray(size)
         else:
             self._header = bytearray(frombytes[0:JD_SERIAL_HEADER_SIZE])
-            self._data = bytearray(frombytes[JD_SERIAL_HEADER_SIZE:])
+            self.data = bytearray(frombytes[JD_SERIAL_HEADER_SIZE:])
         if cmd is not None:
             self.service_command = cmd
 
@@ -309,17 +308,18 @@ class Bus(EventEmitter):
         self.servers: list['Server'] = []
         self.busio = busio.JACDAC(pin)
 
+        from . import ctrl
         ctrls = ctrl.CtrlServer(self)  # attach control server
         async def announce():
             ctrls.queue_announce()
-        tasko.schedule(2, announce())
+        tasko.schedule(2, announce)
 
     def process_packet(self, pkt: JDPacket):
         pass
 
     def _send_core(self, pkt: JDPacket):
-        assert pkt._data.length == pkt._header[12]
-        # TODO
+        assert len(pkt._data) == pkt._header[12]
+        self.busio.send(pkt._header + pkt._data)
         self.process_packet(pkt)  # handle loop-back packet
 
     def clear_attach_cache(self):
@@ -404,7 +404,11 @@ class Bus(EventEmitter):
             if pkt.is_command:
                 return  # it's a command, and it's not for us
 
-            dev = next(d for d in self.devices if d.device_id == dev_id, None)
+            dev = None
+            try:
+                dev = next(d for d in self.devices if d.device_id == dev_id)
+            except:
+                pass
 
             if (pkt.service_index == JD_SERVICE_INDEX_CTRL):
                 if (pkt.service_command == 0):
@@ -448,7 +452,7 @@ def delayed_callback(seconds, fn):
     async def task():
         await tasko.sleep(seconds)
         fn()
-    tasko.add_task(task())
+    tasko.add_task(task)
 
 
 class RawRegisterClient(EventEmitter):

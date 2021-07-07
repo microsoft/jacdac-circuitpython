@@ -42,11 +42,14 @@ class CtrlServer(Server):
         self.restart_counter = 0
 
     def queue_announce(self):
+        log("announce: %d " % self.restart_counter)
+        self.restart_counter += 1
         ids = [s.service_class for s in self.bus. servers]
-        if self.restart_counter < 0xf:
-            self.restart_counter += 1
+        rest = self.restart_counter
+        if rest > 0xf:
+            rest = 0xf
         ids[0] = (
-            self.restart_counter |
+            rest |
             _JD_CONTROL_ANNOUNCE_FLAGS_IS_CLIENT |
             _JD_CONTROL_ANNOUNCE_FLAGS_SUPPORTS_ACK |
             _JD_CONTROL_ANNOUNCE_FLAGS_SUPPORTS_BROADCAST |
