@@ -1,16 +1,29 @@
 import struct
-import ubinascii
+
+_hex = "0123456789abcdef"
+
 
 def hex_num(n: int, len=8):
-    hex = "0123456789abcdef"
     r = "0x"
     for i in range(len):
-        r += hex[(n >> ((len - 1 - i) * 4)) & 0xf]
+        r += _hex[(n >> ((len - 1 - i) * 4)) & 0xf]
     return r
 
 
 def buf2hex(buf: bytes):
-    return str(ubinascii.hexlify(buf), "utf-8")
+    r = ""
+    # is this quadartic?
+    for b in buf:
+        r += _hex[b >> 4] + _hex[b & 0xf]
+    return r
+
+
+def hex2buf(s: str):
+    r = bytearray(len(s) >> 1)
+    for idx in range(0, len(s), 2):
+        r[idx >> 1] = (_hex.index(s[idx].lower()) <<
+                       4) | _hex.index(s[idx+1].lower())
+    return r
 
 
 def u16(buf: bytes, off: int):
@@ -37,5 +50,3 @@ def pack(fmt: str, *args):
     if len(args) == 1 and isinstance(args[1], tuple):
         args = args[1]
     return struct.pack("<" + fmt, *args)
-
-

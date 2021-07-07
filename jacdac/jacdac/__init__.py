@@ -1,7 +1,6 @@
 import busio
 from micropython import const
 import time
-import ubinascii
 
 import tasko
 
@@ -136,8 +135,8 @@ class JDPacket:
         return util.buf2hex(self._header[4:12])
 
     @device_identifier.setter
-    def device_identifier(self, id: str):
-        id = ubinascii.unhexlify(id)
+    def device_identifier(self, id_str: str):
+        id = util.hex2buf(id_str)
         if len(id) != 8:
             raise ValueError()
         self._header[4:12] = id
