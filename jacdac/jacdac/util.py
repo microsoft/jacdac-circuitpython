@@ -1,4 +1,7 @@
 import struct
+import busio
+import binascii
+
 
 _hex = "0123456789abcdef"
 
@@ -11,19 +14,21 @@ def hex_num(n: int, len=8):
 
 
 def buf2hex(buf: bytes):
-    r = ""
-    # is this quadartic?
-    for b in buf:
-        r += _hex[b >> 4] + _hex[b & 0xf]
-    return r
+    return binascii.hexlify(buf).decode()
+    # r = ""
+    # # is this quadartic?
+    # for b in buf:
+    #     r += _hex[b >> 4] + _hex[b & 0xf]
+    # return r
 
 
 def hex2buf(s: str):
-    r = bytearray(len(s) >> 1)
-    for idx in range(0, len(s), 2):
-        r[idx >> 1] = (_hex.index(s[idx].lower()) <<
-                       4) | _hex.index(s[idx+1].lower())
-    return r
+    return binascii.unhexlify(s)
+    # r = bytearray(len(s) >> 1)
+    # for idx in range(0, len(s), 2):
+    #     r[idx >> 1] = (_hex.index(s[idx].lower()) <<
+    #                    4) | _hex.index(s[idx+1].lower())
+    # return r
 
 
 def u16(buf: bytes, off: int):
@@ -50,3 +55,19 @@ def pack(fmt: str, *args):
     if len(args) == 1 and isinstance(args[0], (tuple, list)):
         args = args[0]
     return struct.pack("<" + fmt, *args)
+
+
+def hash(buf: bytes, bits=30):
+    return busio.JACDAC.__dict__["hash"](buf, bits)
+
+
+def short_id(longid: bytes):
+    if isinstance(longid, str):
+        longid = hex2buf(longid)
+    h = hash(longid)
+    return (
+        chr(0x41 + h % 26) +
+        chr(0x41 + (h // 26) % 26) +
+        chr(0x30 + (h // (26 * 26)) % 10) +
+        chr(0x30 + (h // (26 * 26 * 10)) % 10)
+    )

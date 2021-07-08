@@ -92,6 +92,7 @@ _ACK_DELAY = const(40)
 
 logging = False
 
+
 def log(msg: str, *args):
     if logging:
         if len(args):
@@ -331,13 +332,15 @@ class Bus(EventEmitter):
             self.debug_dump()
         tasko.schedule(0.5, debug_info)
 
+        from . import sample
+        sample.acc_sample(self)
 
     def debug_dump(self):
         print("Devices:")
         for dev in self.devices:
             info = dev.debug_info()
             if dev is self.self_device:
-                info = "SELF: "  + info
+                info = "SELF: " + info
             print(info)
         print("END")
 
@@ -675,6 +678,8 @@ class Client(EventEmitter):
             r = self._lookup_register(pkt.reg_code)
             if r is not None:
                 r.handle_packet(pkt)
+        if pkt.is_event:
+            self.emit(EV_EVENT, pkt)
         self.handle_packet(pkt)
 
     def send_cmd(self, pkt: JDPacket):
@@ -751,11 +756,11 @@ class Device(EventEmitter):
 
     @property
     def short_id(self):
-        return self.device_id  # TODO
+        return util.short_id(self.device_id)
 
     def __str__(self) -> str:
         return "<JDDevice {}>".format(self.short_id)
-    
+
     def debug_info(self):
         r = "Device: " + self.short_id + "; "
         for i in range(self.num_service_classes):
@@ -770,7 +775,7 @@ class Device(EventEmitter):
         return util.u32(self.services, idx << 2)
 
     def matches_role_at(self, role: str, service_idx: int):
-        if not role or role == self.device_id or role == self.device_id + ":" + service_idx:
+        if not role or role == self.device_id or role == "{}:{}".format(self.device_id, service_idx):
             return True
         return True
         # return jacdac._rolemgr.getRole(self.deviceId, serviceIdx) == role
