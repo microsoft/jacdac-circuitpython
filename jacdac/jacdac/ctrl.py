@@ -58,9 +58,6 @@ class CtrlServer(Server):
         buf = util.pack("%dI" % len(ids), ids)
         self.send_report(JDPacket(cmd=0, data=buf))
 
-        self.bus.emit(EV_SELF_ANNOUNCE)
-        # self.gc_devices()
-
         # auto bind
         # if jacdac.role_manager_server.auto_bind:
         #     self.auto_bind_cnt++
@@ -94,7 +91,7 @@ class CtrlServer(Server):
         if pkt.is_reg_get:
             if pkt.reg_code == _JD_CONTROL_REG_UPTIME:
                 self.send_report(JDPacket.packed(
-                    CMD_GET_REG | _JD_CONTROL_REG_UPTIME, "Q",  time.monotonic_ns()/1000))
+                    CMD_GET_REG | _JD_CONTROL_REG_UPTIME, "Q",  time.monotonic_ns() // 1000))
         else:
             cmd = pkt.service_command
             if cmd == _JD_CONTROL_CMD_SERVICES:

@@ -90,11 +90,13 @@ EV_DISCONNECTED = "disconnected"
 _ACK_RETRIES = const(4)
 _ACK_DELAY = const(40)
 
+logging = False
 
 def log(msg: str, *args):
-    if len(args):
-        msg = msg.format(*args)
-    print("JD: " + msg)
+    if logging:
+        if len(args):
+            msg = msg.format(*args)
+        print("JD: " + msg)
 
 
 def now():
@@ -310,12 +312,50 @@ class Bus(EventEmitter):
 
         from . import ctrl
         ctrls = ctrl.CtrlServer(self)  # attach control server
+
         async def announce():
+            self.emit(EV_SELF_ANNOUNCE)
+            self._gc_devices()
             ctrls.queue_announce()
         tasko.schedule(2, announce)
 
-    def process_packet(self, pkt: JDPacket):
-        pass
+        async def process_packets():
+            while True:
+                pkt = self.busio.receive()
+                if not pkt:
+                    break
+                self.process_packet(JDPacket(frombytes=pkt))
+        tasko.schedule(100, process_packets)
+
+        async def debug_info():
+            self.debug_dump()
+        tasko.schedule(0.5, debug_info)
+
+
+    def debug_dump(self):
+        print("Devices:")
+        for dev in self.devices:
+            info = dev.debug_info()
+            if dev is self.self_device:
+                info = "SELF: "  + info
+            print(info)
+        print("END")
+
+    def _gc_devices(self):
+        now_ = now()
+        cutoff = now_ - 2000
+        self.self_device.last_seen = now_  # make sure not to gc self
+
+        newdevs = []
+        for dev in self.devices:
+            if dev.last_seen < cutoff:
+                dev._destroy()
+            else:
+                newdevs.append(dev)
+        if len(newdevs) != len(self.devices):
+            self.devices = newdevs
+            self.emit(EV_DEVICE_CHANGE)
+            self.emit(EV_CHANGE)
 
     def _send_core(self, pkt: JDPacket):
         assert len(pkt._data) == pkt._header[12]
@@ -371,7 +411,7 @@ class Bus(EventEmitter):
                         break
 
     def process_packet(self, pkt: JDPacket):
-        # log("route: {}", pkt)
+        log("route: {}", pkt)
         dev_id = pkt.device_identifier
         multi_command_class = pkt.multicommand_class
 
@@ -390,14 +430,14 @@ class Bus(EventEmitter):
             if not pkt.is_command:
                 return  # only commands supported in multi-command
             for h in self.servers:
-                if h.service_class == multi_command_class and h.running:
+                if h.service_class == multi_command_class:
                     # pretend it's directly addressed to us
                     pkt.device_identifier = self.self_device.device_id
                     pkt.service_index = h.service_index
                     h.handle_packet_outer(pkt)
         elif dev_id == self.self_device.device_id and pkt.is_command:
             h = self.servers[pkt.service_index]
-            if h and h.running:
+            if h:
                 # log(`handle pkt at ${h.name} cmd=${pkt.service_command}`)
                 h.handle_packet_outer(pkt)
         else:
@@ -423,7 +463,7 @@ class Bus(EventEmitter):
 
                     matches = False
                     if not dev:
-                        dev = Device(pkt.device_identifier, pkt.data)
+                        dev = Device(self, pkt.device_identifier, pkt.data)
                         # ask for uptime
                         # dev.send_ctrl_command(CMD_GET_REG | ControlReg.Uptime)
                         self.emit(EV_DEVICE_CONNECT, dev)
@@ -578,7 +618,8 @@ class Server(EventEmitter):
         if reg != register:
             return current
         if getset == 1:
-            self.send_report(JDPacket.packed(pkt.service_command, fmt, current))
+            self.send_report(JDPacket.packed(
+                pkt.service_command, fmt, current))
         else:
             if register >> 8 == 0x1:
                 return current  # read-only
@@ -714,6 +755,12 @@ class Device(EventEmitter):
 
     def __str__(self) -> str:
         return "<JDDevice {}>".format(self.short_id)
+    
+    def debug_info(self):
+        r = "Device: " + self.short_id + "; "
+        for i in range(self.num_service_classes):
+            r += util.hex_num(self.service_class_at(i)) + ", "
+        return r
 
     def service_class_at(self, idx: int):
         if idx == 0:
