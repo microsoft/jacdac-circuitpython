@@ -228,7 +228,7 @@ class JDPacket:
 
     def to_string(self):
         msg = "{}/{}[{}]: {} sz={}".format(
-            self.device_identifier,
+            util.short_id(self._header[4:12]),
             self.service_index,
             self.packet_flags,
             util.hex_num(self.service_command, 4),
@@ -251,7 +251,7 @@ def _execute(fn, args):
             res = fn(*args)
             if hasattr(res, "__await__"):
                 await res
-    tasko.add_task(later)
+    tasko.add_task(later())
 
 
 class EventEmitter:
@@ -307,9 +307,9 @@ class Bus(EventEmitter):
         self.devices: list['Device'] = []
         self.unattached_clients: list['Client'] = []
         self.all_clients: list['Client'] = []
-        self.self_device = Device(self, "1234aabbccdd9900", bytearray(4))
         self.servers: list['Server'] = []
         self.busio = busio.JACDAC(pin)
+        self.self_device = Device(self, util.buf2hex(self.busio.uid()), bytearray(4))
 
         from . import ctrl
         ctrls = ctrl.CtrlServer(self)  # attach control server
@@ -328,9 +328,9 @@ class Bus(EventEmitter):
                 self.process_packet(JDPacket(frombytes=pkt))
         tasko.schedule(100, process_packets)
 
-        async def debug_info():
-            self.debug_dump()
-        tasko.schedule(0.5, debug_info)
+        # async def debug_info():
+        #     self.debug_dump()
+        # tasko.schedule(0.5, debug_info)
 
         from . import sample
         sample.acc_sample(self)

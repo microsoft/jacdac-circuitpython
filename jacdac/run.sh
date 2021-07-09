@@ -5,9 +5,11 @@ set -e
 set -x
 
 # just validete with mpy-cross
-for f in jacdac/*.py ; do
+for f in jacdac/*.py  ; do
   $MPYC $f
 done
-rm -f jacdac/*.mpy
+#rm -f jacdac/*.mpy
 
-cp -r code.py jacdac /Volumes/CIRCUITPY/
+mkdir -p /Volumes/CIRCUITPY/jacdac
+cp code.py /Volumes/CIRCUITPY/
+cp jacdac/*.mpy /Volumes/CIRCUITPY/jacdac/

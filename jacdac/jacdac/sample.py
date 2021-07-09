@@ -10,6 +10,6 @@ _JD_BUTTON_EV_HOLD = const(0x81)
 
 def acc_sample(bus:Bus):
     btn = Client(bus, _JD_SERVICE_CLASS_BUTTON, "btn")
-    def btn_ev(pkt:JDPacket):
+    def btn_ev(pkt: JDPacket):
         print("btn", pkt.event_code)
     btn.on(EV_EVENT, btn_ev)
