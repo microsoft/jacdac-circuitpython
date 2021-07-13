@@ -258,18 +258,30 @@ class EventEmitter:
     def emit(self, id: str, *args):
         if not hasattr(self, "_listeners"):
             return
-        # copy list before iteration, in case it's modified
-        for lid, fn in self._listeners[:]:
+        fns = []
+        idx = 0
+        while idx < len(self._listeners):
+            lid, fn, once = self._listeners[idx]
             if lid == id:
-                _execute(fn, args)
+                fns.append(fn)
+                if once:
+                    del self._listeners[idx]
+                    idx -= 1
+            idx += 1
+        for fn in fns:
+            _execute(fn, args)
 
     def _init_emitter(self):
         if not hasattr(self, "_listeners"):
-            self._listeners = []
+            self._listeners: list = []
 
     def on(self, id: str, fn):
         self._init_emitter()
-        self._listeners.append((id, fn))
+        self._listeners.append((id, fn, False))
+
+    def once(self, id: str, fn):
+        self._init_emitter()
+        self._listeners.append((id, fn, True))
 
     def off(self, id: str, fn):
         self._init_emitter()
@@ -278,13 +290,7 @@ class EventEmitter:
             if id == id2 and fn is fn2:
                 del self._listeners[i]
                 return
-        raise ValueError("no matching on")
-
-    def once(self, id: str, fn):
-        def wrapper(*args):
-            self.off(id, wrapper)
-            fn(*args)
-        self.on(id, wrapper)
+        raise ValueError("no matching on() for off()")
 
     async def event(self, id: str):
         suspend, resume = tasko.suspend()
@@ -309,7 +315,8 @@ class Bus(EventEmitter):
         self.all_clients: list['Client'] = []
         self.servers: list['Server'] = []
         self.busio = busio.JACDAC(pin)
-        self.self_device = Device(self, util.buf2hex(self.busio.uid()), bytearray(4))
+        self.self_device = Device(
+            self, util.buf2hex(self.busio.uid()), bytearray(4))
 
         from . import ctrl
         ctrls = ctrl.CtrlServer(self)  # attach control server
@@ -495,7 +502,7 @@ def delayed_callback(seconds, fn):
     async def task():
         await tasko.sleep(seconds)
         fn()
-    tasko.add_task(task)
+    tasko.add_task(task())
 
 
 class RawRegisterClient(EventEmitter):
@@ -515,13 +522,17 @@ class RawRegisterClient(EventEmitter):
         self.client.send_cmd(pkt)
 
     def refresh(self):
+        if self._refreshed_at < 0:
+            return # already in progress
         prev_data = self._data
+        self._refreshed_at = -1
 
         def final_check():
             if prev_data is self._data:
                 # if we still didn't get any data, emit "change" event, so that queries can time out
                 self._data = None
-                self.emit(EV_CHANGE, None)
+                self._refreshed_at = 0
+                self.emit(EV_CHANGE)
 
         def second_refresh():
             if prev_data is self._data:
@@ -543,14 +554,15 @@ class RawRegisterClient(EventEmitter):
         self.refresh()
         await self.event(EV_CHANGE)
         if self._data is None:
-            raise RuntimeError("Can't read reg #{} (from {})",
-                               self.code, self.client)
+            raise RuntimeError(
+                "Can't read reg #{} (from {})".format(self.code, self.client))
         return self._data
 
     def handle_packet(self, pkt: JDPacket):
         if pkt.is_reg_get and pkt.reg_code == self.code:
             self._data = pkt.data
-            self.emit(EV_CHANGE, self._data)
+            self._refreshed_at = now()
+            self.emit(EV_CHANGE)
 
 
 class Server(EventEmitter):
@@ -656,6 +668,11 @@ class Client(EventEmitter):
         self._registers: list[RawRegisterClient] = []
         bus.unattached_clients.append(self)
         bus.all_clients.append(self)
+
+    def __str__(self) -> str:
+        return "<Client '{}' srv:{} bnd:{}/{}>".format(
+            self.role, util.hex_num(self.service_class),
+            self.device and self.device.short_id, self.service_index)
 
     def _lookup_register(self, code: int):
         for reg in self._registers:

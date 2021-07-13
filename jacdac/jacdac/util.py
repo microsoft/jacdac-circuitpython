@@ -47,7 +47,7 @@ def u32(buf: bytes, off: int):
 # TODO would we want the "u32 u16" kind of format strings?
 def unpack(buf: bytes, fmt: str = None):
     if fmt is None or buf is None:
-        return buf
+        return None
     return struct.unpack("<" + fmt, buf)
 
 
