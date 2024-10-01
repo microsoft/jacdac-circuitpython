@@ -1,3 +1,5 @@
+> NOTE: **Jacdac has moved to the organization https://github.com/jacdac**
+
 # Jacdac CircuitPython
 
 This repository implements Jacdac in CircuitPython. 
